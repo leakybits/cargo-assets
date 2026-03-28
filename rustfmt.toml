@@ -1,0 +1,4 @@
+group_imports = "One"
+imports_granularity = "Module"
+merge_derives = false
+wrap_comments = true

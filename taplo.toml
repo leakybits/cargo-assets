@@ -1,0 +1,4 @@
+exclude = ["target/**", "crates/llm-sys/lib/llama.cpp/**"]
+
+[formatting]
+column_width = 120
