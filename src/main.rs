@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use camino::Utf8PathBuf;
-use clap::Parser;
+use clap::{Args, Parser};
 use serde::Deserialize;
 use sha2::Digest;
 use std::process::Command;
@@ -16,11 +16,23 @@ trait AsyncRun {
     async fn run(self) -> Result<()>;
 }
 
-/// Download assets specified in Cargo.toml to the target directory.
 #[derive(Debug, Parser)]
-struct Cmd {}
+enum Cmd {
+    Assets(AssetsCmd),
+}
 
 impl AsyncRun for Cmd {
+    async fn run(self) -> Result<()> {
+        match self {
+            Self::Assets(cmd) => cmd.run().await,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct AssetsCmd;
+
+impl AsyncRun for AssetsCmd {
     async fn run(self) -> Result<()> {
         let output = Command::new("cargo")
             .args(["metadata"])
