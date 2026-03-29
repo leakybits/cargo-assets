@@ -1,5 +1,4 @@
 fmt:
-    cargo clippy --all-targets --fix --allow-staged --allow-dirty
     cargo fmt
     taplo fmt
 
