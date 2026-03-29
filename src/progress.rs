@@ -11,7 +11,6 @@ pub enum ProgressMsg {
     },
     Finish {
         id: usize,
-        msg: String,
     },
     Error {
         id: usize,

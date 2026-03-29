@@ -94,11 +94,9 @@ impl AsyncRun for SyncCmd {
                             pb.inc(n);
                         }
                     }
-                    ProgressMsg::Finish { id, msg } => {
+                    ProgressMsg::Finish { id } => {
                         if let Some(pb) = bars.remove(&id) {
-                            pb.finish_with_message(msg);
-                        } else {
-                            let _ = mp.println(msg);
+                            pb.finish_and_clear();
                         }
                     }
                     ProgressMsg::Error { id, msg } => {

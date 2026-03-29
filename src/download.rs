@@ -23,11 +23,7 @@ impl<'a> Task for DownloadAssetTask<'a> {
         let path = self.assets_dir.join(&self.asset.name);
 
         if path.exists() {
-            tx.send(ProgressMsg::Finish {
-                id: self.id,
-                msg: format!("✅ {} (cached)", self.asset.name),
-            })
-            .await?;
+            tx.send(ProgressMsg::Finish { id: self.id }).await?;
             return Ok(());
         }
 
@@ -71,11 +67,7 @@ impl<'a> Task for DownloadAssetTask<'a> {
             bail!(msg);
         }
 
-        tx.send(ProgressMsg::Finish {
-            id: self.id,
-            msg: format!("✅ Downloaded {}", self.asset.name),
-        })
-        .await?;
+        tx.send(ProgressMsg::Finish { id: self.id }).await?;
 
         Ok(())
     }
