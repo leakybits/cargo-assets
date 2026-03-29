@@ -6,7 +6,7 @@ use std::process::Command;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CargoMetadata {
     pub packages: Vec<Package>,
     pub target_directory: Utf8PathBuf,
@@ -28,14 +28,14 @@ impl CargoMetadata {
         }
     }
 
-    pub fn all_assets(&self) -> Vec<&Asset> {
+    pub fn assets(&self) -> Vec<Asset> {
         let mut all = Vec::new();
 
         // Workspace assets
         if let Some(meta) = &self.metadata
             && let Some(assets) = &meta.assets
         {
-            all.extend(assets);
+            all.extend(assets.to_owned());
         }
 
         // Package assets
@@ -43,7 +43,7 @@ impl CargoMetadata {
             if let Some(meta) = &pkg.metadata
                 && let Some(assets) = &meta.assets
             {
-                all.extend(assets);
+                all.extend(assets.to_owned());
             }
         }
 
@@ -51,19 +51,19 @@ impl CargoMetadata {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Package {
     pub name: String,
     pub metadata: Option<PackageMetadata>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PackageMetadata {
     pub assets: Option<Vec<Asset>>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Asset {
     /// The name with which to save the asset.
     pub name: String,

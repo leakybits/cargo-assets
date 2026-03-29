@@ -1,41 +1,56 @@
 use crate::metadata::Asset;
-use crate::progress::ProgressMsg;
-use anyhow::{Result, bail};
+use crate::progress::Progress;
+use anyhow::Result;
 use camino::Utf8Path;
 use sha2::Digest;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedSender as Sender;
 
 #[allow(async_fn_in_trait)]
 pub trait Task {
-    async fn perform(&self, tx: &mpsc::Sender<ProgressMsg>) -> Result<()>;
+    async fn run(&self) -> Result<()>;
 }
 
-pub struct DownloadAssetTask<'a> {
+#[derive(Debug)]
+pub struct SyncAssetTask<'a> {
     pub id: usize,
-    pub asset: &'a Asset,
+    pub name: String,
+    pub url: String,
+    pub sha256: Option<String>,
     pub assets_dir: &'a Utf8Path,
+    pub tx: Sender<Progress>,
 }
 
-impl<'a> Task for DownloadAssetTask<'a> {
-    async fn perform(&self, tx: &mpsc::Sender<ProgressMsg>) -> Result<()> {
-        let path = self.assets_dir.join(&self.asset.name);
+impl<'a> SyncAssetTask<'a> {
+    pub fn new(id: usize, asset: Asset, assets_dir: &'a Utf8Path, tx: Sender<Progress>) -> Self {
+        Self {
+            id,
+            name: asset.name,
+            url: asset.url,
+            sha256: asset.sha256,
+            assets_dir,
+            tx,
+        }
+    }
+}
+
+impl Task for SyncAssetTask<'_> {
+    async fn run(&self) -> Result<()> {
+        let path = self.assets_dir.join(&self.name);
 
         if path.exists() {
-            tx.send(ProgressMsg::Finish { id: self.id }).await?;
+            self.tx.send(Progress::Finish { id: self.id })?;
             return Ok(());
         }
 
-        let mut res = reqwest::get(&self.asset.url).await?.error_for_status()?;
-        let total_size = res.content_length().unwrap_or(0);
+        let mut res = reqwest::get(&self.url).await?.error_for_status()?;
 
-        tx.send(ProgressMsg::Start {
+        self.tx.send(Progress::Start {
             id: self.id,
-            name: self.asset.name.clone(),
-            total_size,
-        })
-        .await?;
+            name: self.name.to_owned(),
+            size: res.content_length().unwrap_or(0),
+        })?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -47,27 +62,24 @@ impl<'a> Task for DownloadAssetTask<'a> {
         while let Some(chunk) = res.chunk().await? {
             dst.write_all(&chunk).await?;
             sha.update(&chunk);
-            tx.send(ProgressMsg::Inc {
+            self.tx.send(Progress::Inc {
                 id: self.id,
                 n: chunk.len() as u64,
-            })
-            .await?;
+            })?;
         }
 
-        if let Some(want) = &self.asset.sha256
+        if let Some(want) = &self.sha256
             && &hex::encode(sha.finalize()) != want
         {
             fs::remove_file(&path).await?;
-            let msg = format!("❌ SHA-256 mismatch for {}", self.asset.name);
-            tx.send(ProgressMsg::Error {
-                id: self.id,
-                msg: msg.clone(),
-            })
-            .await?;
-            bail!(msg);
-        }
 
-        tx.send(ProgressMsg::Finish { id: self.id }).await?;
+            self.tx.send(Progress::Error {
+                id: self.id,
+                msg: format!("SHA-256 mismatch for {}", self.name),
+            })?;
+        } else {
+            self.tx.send(Progress::Finish { id: self.id })?;
+        }
 
         Ok(())
     }
