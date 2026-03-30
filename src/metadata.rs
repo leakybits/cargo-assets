@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use crate::error::{Error, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use sha2::Digest;
@@ -24,7 +24,7 @@ impl CargoMetadata {
         if output.status.success() {
             Ok(serde_json::from_slice(&output.stdout)?)
         } else {
-            bail!(String::from_utf8(output.stderr)?);
+            Err(Error::CargoMetadata(String::from_utf8(output.stderr)?))
         }
     }
 

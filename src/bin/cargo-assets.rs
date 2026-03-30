@@ -4,5 +4,9 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    Cmd::parse().run().await
+    tracing_subscriber::fmt::init();
+
+    Cmd::parse().run().await?;
+
+    Ok(())
 }

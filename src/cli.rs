@@ -1,12 +1,11 @@
 use crate::download::{SyncAssetTask, Task};
+use crate::error::Result;
 use crate::metadata::CargoMetadata;
-use crate::progress::Progress;
-use anyhow::Result;
+use crate::progress::ProgressWatcher;
 use clap::{Args, Parser, Subcommand};
 use futures::prelude::*;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::ProgressStyle;
 use indoc::indoc;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 #[allow(async_fn_in_trait)]
@@ -51,54 +50,14 @@ impl AsyncRun for SyncCmd {
         let metadata = CargoMetadata::load()?;
         let assets = metadata.assets();
         let assets_dir = metadata.target_directory.join("assets");
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let style = ProgressStyle::with_template(indoc! {r"
             {msg}
             [{wide_bar}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})
         "})?;
 
-        let progress = async move {
-            let mp = MultiProgress::new();
-            let mut bars = HashMap::new();
-
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    Progress::Start { id, name, size } => {
-                        let pb = mp.add(ProgressBar::new(size as _));
-                        pb.set_style(style.clone());
-                        pb.set_message(name);
-                        bars.insert(id, pb);
-                    }
-
-                    Progress::Reset { id, name, size } => {
-                        if let Some(pb) = bars.get(&id) {
-                            pb.set_length(size as _);
-                            pb.reset();
-                            pb.set_message(name);
-                        }
-                    }
-
-                    Progress::Inc { id, n } => {
-                        if let Some(pb) = bars.get(&id) {
-                            pb.inc(n as _);
-                        }
-                    }
-
-                    Progress::Finish { id } => {
-                        if let Some(pb) = bars.remove(&id) {
-                            pb.finish_and_clear();
-                        }
-                    }
-
-                    Progress::Error { id, msg } => {
-                        if let Some(pb) = bars.remove(&id) {
-                            pb.finish_with_message(msg);
-                        }
-                    }
-                }
-            }
-        };
+        let watcher = ProgressWatcher::new(style);
 
         let downloads = async move {
             let rc = reqwest::Client::new();
@@ -117,7 +76,8 @@ impl AsyncRun for SyncCmd {
             res
         };
 
-        let ((), results) = tokio::join!(progress, downloads);
+        let (progress_res, results) = tokio::join!(watcher.watch(rx), downloads);
+        progress_res?;
 
         for result in results {
             result?;

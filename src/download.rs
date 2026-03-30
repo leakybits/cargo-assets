@@ -1,6 +1,6 @@
+use crate::error::{Error, Result};
 use crate::metadata::Asset;
 use crate::progress::Progress;
-use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 use reqwest::Client;
 use sha2::Digest;
@@ -97,7 +97,7 @@ impl SyncAssetTask {
                     id: self.id,
                     msg: format!("SHA-256 mismatch for {}", self.name),
                 })?;
-                return Ok(());
+                return Err(Error::Checksum(self.name.clone()));
             }
         }
 
@@ -157,6 +157,7 @@ impl SyncAssetTask {
                 id: self.id,
                 msg: format!("SHA-256 mismatch for {}", self.name),
             })?;
+            return Err(Error::Checksum(self.name.clone()));
         } else {
             self.tx.send(Progress::Finish { id: self.id })?;
         }
