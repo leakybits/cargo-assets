@@ -1,16 +1,19 @@
-use crate::error::{Error, Result};
+use crate::IO_BUFFER_SIZE;
+use crate::error::{Error, Result, VerificationError};
+use crate::progress::Progress;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use sha2::Digest;
 use std::process::Command;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CargoMetadata {
-    pub packages: Vec<Package>,
-    pub target_directory: Utf8PathBuf,
-    pub metadata: Option<PackageMetadata>,
+    packages: Vec<Package>,
+    target_directory: Utf8PathBuf,
+    metadata: Option<PackageMetadata>,
 }
 
 impl CargoMetadata {
@@ -26,6 +29,10 @@ impl CargoMetadata {
         } else {
             Err(Error::CargoMetadata(String::from_utf8(output.stderr)?))
         }
+    }
+
+    pub fn target_directory(&self) -> &Utf8Path {
+        &self.target_directory
     }
 
     pub fn assets(&self) -> Vec<Asset> {
@@ -52,51 +59,87 @@ impl CargoMetadata {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Package {
-    pub name: String,
-    pub metadata: Option<PackageMetadata>,
+struct Package {
+    metadata: Option<PackageMetadata>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PackageMetadata {
-    pub assets: Option<Vec<Asset>>,
+struct PackageMetadata {
+    assets: Option<Vec<Asset>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Asset {
-    /// The name with which to save the asset.
-    pub name: String,
-
-    /// The URL from which to download the asset.
-    pub url: String,
-
-    /// The SHA-256 hash of the asset.
-    ///
-    /// If provided, the downloaded asset will be verified against this hash.
-    /// If the hash does not match, the asset will be deleted and an error will
-    /// be returned.
-    pub sha256: Option<String>,
+    name: String,
+    url: String,
+    sha256: Option<String>,
 }
 
 impl Asset {
-    pub async fn verify_checksum(&self, path: &Utf8Path) -> Result<bool> {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub async fn verify_checksum(
+        &self,
+        path: &Utf8Path,
+        progress: Option<(usize, &UnboundedSender<Progress>)>,
+    ) -> Result<()> {
         let Some(want) = &self.sha256 else {
-            return Ok(true);
+            return Ok(());
         };
 
-        let mut file = fs::File::open(path).await?;
+        let mut file = fs::File::open(path)
+            .await
+            .map_err(|e| VerificationError::Io {
+                name: self.name.clone(),
+                source: e,
+            })?;
+
+        if let Some((id, tx)) = progress {
+            tx.send(Progress::Reset {
+                id,
+                name: format!("Verifying {}...", self.name),
+                size: file.metadata().await?.len(),
+            })?;
+        }
+
         let mut sha = sha2::Sha256::new();
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; IO_BUFFER_SIZE];
 
         loop {
-            let n = file.read(&mut buf).await?;
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| VerificationError::Io {
+                    name: self.name.clone(),
+                    source: e,
+                })?;
+
             if n == 0 {
                 break;
             }
             sha.update(&buf[..n]);
+
+            if let Some((id, tx)) = progress {
+                tx.send(Progress::Inc { id, n: n as u64 })?;
+            }
         }
 
-        Ok(&hex::encode(sha.finalize()) == want)
+        let actual = hex::encode(sha.finalize());
+        if actual != *want {
+            return Err(VerificationError::Mismatch {
+                name: self.name.clone(),
+                expected: want.clone(),
+                actual,
+            }
+            .into());
+        }
+
+        Ok(())
     }
 }

@@ -1,11 +1,9 @@
-use crate::download::{SyncAssetTask, Task};
+use crate::download::{CheckAssetTask, SyncAssetTask};
 use crate::error::Result;
 use crate::metadata::CargoMetadata;
 use crate::progress::ProgressWatcher;
 use clap::{Args, Parser, Subcommand};
 use futures::prelude::*;
-use indicatif::ProgressStyle;
-use indoc::indoc;
 use tokio::sync::mpsc;
 
 #[allow(async_fn_in_trait)]
@@ -31,12 +29,14 @@ impl AsyncRun for Cmd {
 #[derive(Debug, Subcommand)]
 pub enum AssetsCmd {
     Sync(SyncCmd),
+    Check(CheckCmd),
 }
 
 impl AsyncRun for AssetsCmd {
     async fn run(self) -> Result<()> {
         match self {
             Self::Sync(cmd) => cmd.run().await,
+            Self::Check(cmd) => cmd.run().await,
         }
     }
 }
@@ -49,39 +49,68 @@ impl AsyncRun for SyncCmd {
     async fn run(self) -> Result<()> {
         let metadata = CargoMetadata::load()?;
         let assets = metadata.assets();
-        let assets_dir = metadata.target_directory.join("assets");
-        let (tx, rx) = mpsc::unbounded_channel();
+        let assets_dir = metadata.target_directory().join("assets");
+        let rc = reqwest::Client::new();
 
-        let style = ProgressStyle::with_template(indoc! {r"
-            {msg}
-            [{wide_bar}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})
-        "})?;
+        let mut tasks = Vec::new();
+        let mut streams = stream::SelectAll::new();
 
-        let watcher = ProgressWatcher::new(style);
-
-        let downloads = async move {
-            let rc = reqwest::Client::new();
-            let tasks = assets
-                .into_iter()
-                .enumerate()
-                .map(|(id, asset)| {
-                    SyncAssetTask::new(id, asset, assets_dir.clone(), tx.clone(), rc.clone())
-                })
-                .map(async |a| a.run().await);
-
-            let res = future::join_all(tasks).await;
-
-            drop(tx);
-
-            res
-        };
-
-        let (progress_res, results) = tokio::join!(watcher.watch(rx), downloads);
-        progress_res?;
-
-        for result in results {
-            result?;
+        for (id, asset) in assets.into_iter().enumerate() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tasks.push(SyncAssetTask::new(
+                id,
+                asset,
+                assets_dir.clone(),
+                tx,
+                rc.clone(),
+            ));
+            streams.push(
+                stream::unfold(rx, |mut rx| async { rx.recv().await.map(|m| (m, rx)) }).boxed(),
+            );
         }
+
+        let watcher = ProgressWatcher::new()?.watch(streams);
+
+        let results = stream::iter(tasks)
+            .map(|t| t.into_future())
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>();
+
+        tokio::try_join!(watcher, results)?;
+
+        Ok(())
+    }
+}
+
+/// Deeply verify all local assets
+#[derive(Debug, Args)]
+pub struct CheckCmd;
+
+impl AsyncRun for CheckCmd {
+    async fn run(self) -> Result<()> {
+        let metadata = CargoMetadata::load()?;
+        let assets = metadata.assets();
+        let assets_dir = metadata.target_directory().join("assets");
+
+        let mut tasks = Vec::new();
+        let mut streams = stream::SelectAll::new();
+
+        for (id, asset) in assets.into_iter().enumerate() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tasks.push(CheckAssetTask::new(id, asset, assets_dir.clone(), tx));
+            streams.push(
+                stream::unfold(rx, |mut rx| async { rx.recv().await.map(|m| (m, rx)) }).boxed(),
+            );
+        }
+
+        let watcher = ProgressWatcher::new()?.watch(streams);
+
+        let results = stream::iter(tasks)
+            .map(|t| t.into_future())
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>();
+
+        tokio::try_join!(watcher, results)?;
 
         Ok(())
     }

@@ -1,8 +1,9 @@
 use crate::error::Result;
 use derive_more::Debug;
+use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indoc::indoc;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum Progress {
@@ -22,17 +23,25 @@ pub struct ProgressWatcher {
 }
 
 impl ProgressWatcher {
-    pub fn new(style: ProgressStyle) -> Self {
-        Self {
+    pub fn new() -> Result<Self> {
+        let style = ProgressStyle::with_template(indoc! {r"
+            {msg}
+            [{wide_bar}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})
+        "})?;
+
+        Ok(Self {
             mp: MultiProgress::new(),
             style,
-        }
+        })
     }
 
-    pub async fn watch(self, mut rx: mpsc::UnboundedReceiver<Progress>) -> Result<()> {
+    pub async fn watch<S>(self, mut stream: S) -> Result<()>
+    where
+        S: futures::Stream<Item = Progress> + Unpin,
+    {
         let mut bars = HashMap::new();
 
-        while let Some(msg) = rx.recv().await {
+        while let Some(msg) = stream.next().await {
             match msg {
                 Progress::Start { id, name, size } => {
                     let pb = self.mp.add(ProgressBar::new(size as _));

@@ -1,30 +1,25 @@
-use crate::error::{Error, Result};
+use crate::error::{DownloadError, Result};
 use crate::metadata::Asset;
 use crate::progress::Progress;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
+use futures::future::BoxFuture;
+use futures::prelude::*;
 use reqwest::Client;
-use sha2::Digest;
+use std::future::IntoFuture;
 use std::io::SeekFrom;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender as Sender;
 
-const CHUNK_SIZE: u64 = 1 << 30; // 1 GiB
-
-#[allow(async_fn_in_trait)]
-pub trait Task {
-    async fn run(&self) -> Result<()>;
-}
+const CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 
 #[derive(Debug)]
 pub struct SyncAssetTask {
-    pub id: usize,
-    pub name: String,
-    pub url: String,
-    pub sha256: Option<String>,
-    pub assets_dir: Utf8PathBuf,
-    pub tx: Sender<Progress>,
-    pub rc: Client,
+    id: usize,
+    asset: Asset,
+    assets_dir: Utf8PathBuf,
+    tx: Sender<Progress>,
+    rc: Client,
 }
 
 impl SyncAssetTask {
@@ -37,84 +32,44 @@ impl SyncAssetTask {
     ) -> Self {
         Self {
             id,
-            name: asset.name,
-            url: asset.url,
-            sha256: asset.sha256,
+            asset,
             assets_dir,
             tx,
             rc,
         }
     }
 
-    async fn download_parallel(&self, path: &Utf8Path, size: u64) -> Result<()> {
-        self.tx.send(Progress::Start {
-            id: self.id,
-            name: self.name.to_owned(),
-            size,
-        })?;
-
-        let file = fs::File::create(path).await?;
-        file.set_len(size).await?;
-        drop(file);
-
-        let mut start = 0;
-        let mut tasks = Vec::new();
-
-        while start < size {
-            let end = (start + CHUNK_SIZE - 1).min(size - 1);
-            tasks.push(self.download_chunk(path, start, end));
-            start += CHUNK_SIZE;
-        }
-
-        futures::future::try_join_all(tasks).await?;
-
-        if let Some(want) = &self.sha256 {
-            self.tx.send(Progress::Reset {
-                id: self.id,
-                name: format!("Verifying {}...", self.name),
-                size,
-            })?;
-
-            let mut file = fs::File::open(path).await?;
-            let mut sha = sha2::Sha256::new();
-            let mut buf = vec![0u8; 1024 * 1024]; // 1MiB buffer
-
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                sha.update(&buf[..n]);
-                self.tx.send(Progress::Inc {
-                    id: self.id,
-                    n: n as u64,
-                })?;
-            }
-
-            if hex::encode(sha.finalize()) != *want {
-                fs::remove_file(path).await?;
-                self.tx.send(Progress::Error {
-                    id: self.id,
-                    msg: format!("SHA-256 mismatch for {}", self.name),
-                })?;
-                return Err(Error::Checksum(self.name.clone()));
-            }
-        }
-
-        self.tx.send(Progress::Finish { id: self.id })?;
-        Ok(())
-    }
-
-    async fn download_chunk(&self, path: &Utf8Path, start: u64, end: u64) -> Result<()> {
-        let mut res = self
+    async fn download_chunk(&self, path: Utf8PathBuf, start: u64, end: u64) -> Result<()> {
+        let res = self
             .rc
-            .get(&self.url)
+            .get(self.asset.url())
             .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|e| DownloadError::Chunk {
+                name: self.asset.name().to_owned(),
+                start,
+                end,
+                source: e,
+            })?
+            .error_for_status()
+            .map_err(|e| DownloadError::Chunk {
+                name: self.asset.name().to_owned(),
+                start,
+                end,
+                source: e,
+            })?;
 
-        let mut file = fs::OpenOptions::new().write(true).open(path).await?;
+        self.process_response(path, start, res).await
+    }
+
+    async fn process_response(
+        &self,
+        path: Utf8PathBuf,
+        start: u64,
+        mut res: reqwest::Response,
+    ) -> Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).open(&path).await?;
         file.seek(SeekFrom::Start(start)).await?;
 
         while let Some(chunk) = res.chunk().await? {
@@ -127,80 +82,162 @@ impl SyncAssetTask {
 
         Ok(())
     }
+}
 
-    async fn download_sequential(&self, path: &Utf8Path) -> Result<()> {
-        let mut res = self.rc.get(&self.url).send().await?.error_for_status()?;
+impl IntoFuture for SyncAssetTask {
+    type Output = Result<()>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
 
-        self.tx.send(Progress::Start {
-            id: self.id,
-            name: self.name.to_owned(),
-            size: res.content_length().unwrap_or(0),
-        })?;
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let path = self.assets_dir.join(self.asset.name());
 
-        let mut dst = fs::File::create(path).await?;
-        let mut sha = sha2::Sha256::new();
+            if path.exists() {
+                self.tx.send(Progress::Finish { id: self.id })?;
+                return Ok(());
+            }
 
-        while let Some(chunk) = res.chunk().await? {
-            dst.write_all(&chunk).await?;
-            sha.update(&chunk);
-            self.tx.send(Progress::Inc {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+
+            // Start by requesting the first chunk to determine size and range support
+            let res = self
+                .rc
+                .get(self.asset.url())
+                .header(
+                    reqwest::header::RANGE,
+                    format!("bytes=0-{}", CHUNK_SIZE - 1),
+                )
+                .send()
+                .await
+                .map_err(|e| DownloadError::Init {
+                    name: self.asset.name().to_owned(),
+                    source: e,
+                })?
+                .error_for_status()
+                .map_err(|e| DownloadError::Init {
+                    name: self.asset.name().to_owned(),
+                    source: e,
+                })?;
+
+            let (total_size, is_partial) = if res.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                let total = res
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split('/').next_back())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                (total, true)
+            } else {
+                (res.content_length().unwrap_or(0), false)
+            };
+
+            self.tx.send(Progress::Start {
                 id: self.id,
-                n: chunk.len() as u64,
+                name: self.asset.name().to_owned(),
+                size: total_size,
             })?;
-        }
 
-        if let Some(want) = &self.sha256
-            && hex::encode(sha.finalize()) != *want
-        {
-            fs::remove_file(path).await?;
-            self.tx.send(Progress::Error {
-                id: self.id,
-                msg: format!("SHA-256 mismatch for {}", self.name),
-            })?;
-            return Err(Error::Checksum(self.name.clone()));
-        } else {
+            let mut chunk_futures: Vec<BoxFuture<'_, Result<()>>> = Vec::new();
+
+            if is_partial && total_size > CHUNK_SIZE {
+                let file = fs::File::create(&path).await?;
+                file.set_len(total_size).await?;
+                drop(file);
+
+                chunk_futures.push(self.process_response(path.clone(), 0, res).boxed());
+
+                let mut start = CHUNK_SIZE;
+                while start < total_size {
+                    let end = (start + CHUNK_SIZE - 1).min(total_size - 1);
+                    chunk_futures.push(self.download_chunk(path.clone(), start, end).boxed());
+                    start += CHUNK_SIZE;
+                }
+            } else {
+                fs::File::create(&path).await?;
+                chunk_futures.push(self.process_response(path.clone(), 0, res).boxed());
+            }
+
+            stream::iter(chunk_futures)
+                .buffer_unordered(4)
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            if let Err(e) = self
+                .asset
+                .verify_checksum(&path, Some((self.id, &self.tx)))
+                .await
+            {
+                fs::remove_file(&path).await?;
+                self.tx.send(Progress::Error {
+                    id: self.id,
+                    msg: e.to_string(),
+                })?;
+                return Err(e);
+            }
+
             self.tx.send(Progress::Finish { id: self.id })?;
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 
-impl Task for SyncAssetTask {
-    async fn run(&self) -> Result<()> {
-        let path = self.assets_dir.join(&self.name);
+pub struct CheckAssetTask {
+    id: usize,
+    asset: Asset,
+    assets_dir: Utf8PathBuf,
+    tx: Sender<Progress>,
+}
 
-        if path.exists() {
+impl CheckAssetTask {
+    pub fn new(id: usize, asset: Asset, assets_dir: Utf8PathBuf, tx: Sender<Progress>) -> Self {
+        Self {
+            id,
+            asset,
+            assets_dir,
+            tx,
+        }
+    }
+}
+
+impl IntoFuture for CheckAssetTask {
+    type Output = Result<()>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let path = self.assets_dir.join(self.asset.name());
+
+            self.tx.send(Progress::Start {
+                id: self.id,
+                name: self.asset.name().to_owned(),
+                size: 0,
+            })?;
+
+            if !path.exists() {
+                self.tx.send(Progress::Error {
+                    id: self.id,
+                    msg: format!("File missing: {}", self.asset.name()),
+                })?;
+                return Ok(());
+            }
+
+            if let Err(e) = self
+                .asset
+                .verify_checksum(&path, Some((self.id, &self.tx)))
+                .await
+            {
+                self.tx.send(Progress::Error {
+                    id: self.id,
+                    msg: e.to_string(),
+                })?;
+                return Err(e);
+            }
+
             self.tx.send(Progress::Finish { id: self.id })?;
-            return Ok(());
-        }
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let head = self.rc.head(&self.url).send().await;
-
-        match head {
-            Ok(res) if res.status().is_success() => {
-                let size = res.content_length().unwrap_or(0);
-                let accept_ranges = res
-                    .headers()
-                    .get(reqwest::header::ACCEPT_RANGES)
-                    .map(|v| v == "bytes")
-                    .unwrap_or(false);
-
-                if accept_ranges && size > CHUNK_SIZE {
-                    self.download_parallel(&path, size).await?;
-                } else {
-                    self.download_sequential(&path).await?;
-                }
-            }
-            _ => {
-                self.download_sequential(&path).await?;
-            }
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 }

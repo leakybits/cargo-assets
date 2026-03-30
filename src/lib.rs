@@ -1,5 +1,7 @@
+pub const IO_BUFFER_SIZE: usize = 64 * 1024; // 64 KiB
+
 pub mod cli;
-pub mod download;
+mod download;
 pub mod error;
-pub mod metadata;
-pub mod progress;
+mod metadata;
+mod progress;
