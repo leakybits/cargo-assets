@@ -71,6 +71,14 @@ impl AsyncRun for SyncCmd {
                         bars.insert(id, pb);
                     }
 
+                    Progress::Reset { id, name, size } => {
+                        if let Some(pb) = bars.get(&id) {
+                            pb.set_length(size as _);
+                            pb.reset();
+                            pb.set_message(name);
+                        }
+                    }
+
                     Progress::Inc { id, n } => {
                         if let Some(pb) = bars.get(&id) {
                             pb.inc(n as _);
@@ -93,10 +101,13 @@ impl AsyncRun for SyncCmd {
         };
 
         let downloads = async move {
+            let rc = reqwest::Client::new();
             let tasks = assets
                 .into_iter()
                 .enumerate()
-                .map(|(id, asset)| SyncAssetTask::new(id, asset, &assets_dir, tx.clone()))
+                .map(|(id, asset)| {
+                    SyncAssetTask::new(id, asset, assets_dir.clone(), tx.clone(), rc.clone())
+                })
                 .map(async |a| a.run().await);
 
             let res = future::join_all(tasks).await;
